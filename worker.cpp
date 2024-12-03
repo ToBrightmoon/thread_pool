@@ -1,8 +1,5 @@
 #include "worker.h"
 
-#include <iostream>
-#include <ostream>
-
 #include "thread_pool.hpp"
 
 Worker::Worker()
@@ -113,7 +110,7 @@ bool Worker::is_busy() const
 size_t Worker::pending_task_size() const
 {
     std::shared_lock lock(mtx_);
-    return task_queue_.size();
+    return (status_ == WorkerStatus::Busy) ? ( task_queue_.empty() ? 0 : task_queue_.size() -1 ) : (task_queue_.size());
 }
 
 void Worker::notify()
@@ -140,10 +137,10 @@ void Worker::run()
             {
                 return;
             }
-
-            task = task_queue_.pop();
+            task = task_queue_.top();
         }
         task();
+        task_queue_.pop();
     }
 }
 

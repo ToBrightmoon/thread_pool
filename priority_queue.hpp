@@ -63,6 +63,17 @@ public:
         throw std::out_of_range("PriorityQueue::pop");
     }
 
+    T top()
+    {
+        std::unique_lock lock(mtx_);
+        if (!queue_.empty())
+        {
+            T val = queue_.top();
+            return val;
+        }
+        throw std::out_of_range("PriorityQueue::pop");
+    }
+
     size_t size() const
     {
         std::shared_lock lock(mtx_);
