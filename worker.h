@@ -46,8 +46,8 @@ private:
     void run();
 
     mutable std::shared_mutex mtx_;
-    WorkerStatus status_ = WorkerStatus::Busy;
     PriorityQueue<Task> task_queue_;
     std::condition_variable_any cond_;
     std::unique_ptr<std::thread> thread_ptr_;
+    WorkerStatus status_ = WorkerStatus::Busy;
 };

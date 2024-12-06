@@ -1,5 +1,4 @@
 #include "worker.h"
-
 #include "thread_pool.hpp"
 
 Worker::Worker()
@@ -94,7 +93,6 @@ void Worker::stop()
         task_queue_.clear();
     }
     notify();
-
     if (thread_ptr_ && thread_ptr_->joinable())
     {
         thread_ptr_->join();
@@ -110,7 +108,7 @@ bool Worker::is_busy() const
 size_t Worker::pending_task_size() const
 {
     std::shared_lock lock(mtx_);
-    return (status_ == WorkerStatus::Busy) ? ( task_queue_.empty() ? 0 : task_queue_.size() -1 ) : (task_queue_.size());
+    return task_queue_.size();
 }
 
 void Worker::notify()
@@ -140,7 +138,11 @@ void Worker::run()
             task = task_queue_.top();
         }
         task();
-        task_queue_.pop();
+        {
+            std::unique_lock lock(mtx_);
+            if (!task_queue_.empty())
+                task_queue_.pop();
+        }
     }
 }
 
