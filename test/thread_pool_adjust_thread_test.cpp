@@ -38,6 +38,6 @@ int main()
 
     cv.wait(lock,[&pool]()
     {
-        return pool.get_pending_task_num() == 0;
+        return pool.get_task_num() == 0;
     });
 }

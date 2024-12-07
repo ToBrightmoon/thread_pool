@@ -44,10 +44,9 @@ public:
 
     Status get_status() const;
 
-    size_t get_pending_task_num() const;
+    size_t get_task_num() const;
 
     static std::string status_to_string(const Status &status);
-
 
 private:
 
@@ -149,7 +148,7 @@ inline size_t ThreadPool::get_thread_num() const
     return workers_.size();
 }
 
-inline size_t ThreadPool::get_pending_task_num() const
+inline size_t ThreadPool::get_task_num() const
 {
     std::shared_lock lock(mtx_);
     return std::accumulate(workers_.begin(), workers_.end(), task_queue_.size(), [](size_t total, const auto &worker)
