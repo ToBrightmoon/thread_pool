@@ -1,16 +1,16 @@
 #pragma once
 
-#include <future>
-#include "worker.h"
+#include "default_strategy.h"
 
+#include <future>
 #include <iostream>
 #include <numeric>
-#include <ostream>
 
 class ThreadPool
 {
     using Worker_ptr = std::shared_ptr<Worker>;
 
+public:
     enum Status : int32_t
     {
         Running,
@@ -18,9 +18,9 @@ class ThreadPool
         Stop
     };
 
-public:
     explicit ThreadPool(size_t min_thread_num = 1, size_t thread_num = std::thread::hardware_concurrency() - 1,
-                        size_t max_thread_num = std::thread::hardware_concurrency() - 1);
+                        size_t max_thread_num = std::thread::hardware_concurrency() - 1,
+                        const std::shared_ptr<ThreadPoolStrategy> &strategy = std::make_shared<DefaultStrategy>());
 
     ~ThreadPool();
 
@@ -36,9 +36,21 @@ public:
     auto add_task(TaskPriority priority, Fn &&f, Args &&...args)
             -> std::future<decltype(f(std::forward<Args>(args)...))>;
 
+    template<typename Fn, typename... Args>
+    auto add_task(Fn &&f, Args &&...args)
+            -> std::future<decltype(f(std::forward<Args>(args)...))>;
+
     size_t get_thread_num() const;
 
+    Status get_status() const;
+
+    size_t get_pending_task_num() const;
+
+    static std::string status_to_string(const Status &status);
+
+
 private:
+
     void dispatch_task(const Task &task);
 
     void add_worker();
@@ -51,14 +63,16 @@ private:
     std::vector<Worker_ptr> workers_;
     std::condition_variable_any cond_;
     std::unique_ptr<std::thread> thread_;
+    std::shared_ptr<ThreadPoolStrategy> strategy_;
 
     size_t min_thread_num_ = 1;
     size_t thread_num_ = std::thread::hardware_concurrency() - 1;
     size_t max_thread_num_ = std::thread::hardware_concurrency() - 1;
 };
 
-inline ThreadPool::ThreadPool(size_t min_thread_num, size_t thread_num, size_t max_thread_num) :
-    min_thread_num_(min_thread_num), thread_num_(thread_num), max_thread_num_(max_thread_num)
+inline ThreadPool::ThreadPool(size_t min_thread_num, size_t thread_num, size_t max_thread_num,
+                              const std::shared_ptr<ThreadPoolStrategy> &strategy) :
+    strategy_(strategy), min_thread_num_(min_thread_num), thread_num_(thread_num), max_thread_num_(max_thread_num)
 {
     workers_.reserve(max_thread_num_);
 }
@@ -114,23 +128,55 @@ inline void ThreadPool::pause()
 
 inline void ThreadPool::resume()
 {
-    std::unique_lock<std::shared_mutex> lock(mtx_);
-    if (status_ == Status::Pause)
     {
-        status_ = Status::Running;
+        std::unique_lock<std::shared_mutex> lock(mtx_);
+        if (status_ == Status::Pause)
+        {
+            status_ = Status::Running;
+        }
+        for (auto &worker: workers_)
+        {
+            worker->work();
+        }
     }
 
     cond_.notify_all();
-    for (auto &worker: workers_)
-    {
-        worker->work();
-    }
 }
 
 inline size_t ThreadPool::get_thread_num() const
 {
     std::shared_lock lock(mtx_);
     return workers_.size();
+}
+
+inline size_t ThreadPool::get_pending_task_num() const
+{
+    std::shared_lock lock(mtx_);
+    return std::accumulate(workers_.begin(), workers_.end(), task_queue_.size(), [](size_t total, const auto &worker)
+    {
+        return total + worker->pending_task_size();
+    });
+}
+
+inline ThreadPool::Status ThreadPool::get_status() const
+{
+    std::shared_lock lock(mtx_);
+    return status_;
+}
+
+inline std::string ThreadPool::status_to_string(const Status &status)
+{
+    switch (status)
+    {
+        case Status::Running:
+            return "Running";
+        case Status::Pause:
+            return "Pause";
+        case Status::Stop:
+            return "Stop";
+        default:
+            return "Unknown";
+    }
 }
 
 inline void ThreadPool::add_worker()
@@ -156,7 +202,7 @@ auto ThreadPool::add_task(TaskPriority priority, Fn &&f, Args &&...args)
         std::unique_lock lock(mtx_);
         if (status_ == Status::Stop)
         {
-            throw std::runtime_error("ThreadPool::add_task() failed");
+            throw std::runtime_error("ThreadPool::add_task() failed, The ThreadPool has been Stopped.");
         }
         task_queue_.push(priority_task);
     }
@@ -164,50 +210,26 @@ auto ThreadPool::add_task(TaskPriority priority, Fn &&f, Args &&...args)
     return future;
 }
 
+template<typename Fn, typename... Args>
+    auto ThreadPool::add_task(Fn &&f, Args &&...args)
+            -> std::future<decltype(f(std::forward<Args>(args)...))>
+{
+    return add_task(TaskPriority::Normal,std::forward<Fn>(f), std::forward<Args>(args)...);
+}
+
 inline void ThreadPool::monitor()
 {
     while (true)
     {
         std::unique_lock<std::shared_mutex> lock(mtx_);
-        cond_.wait_for(lock, std::chrono::milliseconds(100),
-                       [&]() { return status_ == Status::Stop || (status_ == Status::Running && !task_queue_.empty()); });
+        cond_.wait_for(lock, std::chrono::milliseconds(100), [&]()
+                       { return status_ == Status::Stop || (status_ == Status::Running && !task_queue_.empty()); });
 
         if (status_ == Status::Stop)
             return;
 
-        size_t rest_thread_num =
-                std::count_if(workers_.begin(), workers_.end(), [&](const Worker_ptr &worker) { return !worker->is_busy(); });
-        size_t pending_task_num =
-                std::accumulate(workers_.begin(), workers_.end(), (size_t) 0,
-                                [](size_t sum, const Worker_ptr &worker) { return sum + worker->pending_task_size(); });
+        strategy_->adjust_worker(min_thread_num_,max_thread_num_,task_queue_.size(),workers_);
 
-        if (rest_thread_num >= (workers_.size() / 2)  && max_thread_num_ > 1)
-        {
-            size_t remove_worker_num = std::min(rest_thread_num / 2, workers_.size() - min_thread_num_);
-            for (size_t i = 0; i < remove_worker_num; ++i)
-            {
-                auto it = std::min_element(workers_.begin(), workers_.end(), [](const Worker_ptr &a, const Worker_ptr &b)
-                {
-                    return a->pending_task_size() < b->pending_task_size();
-                });
-                if (it == workers_.end())
-                    break;
-                it->get()->stop();
-                workers_.erase(it);
-            }
-        };
-
-        if (rest_thread_num == 0 && pending_task_num > 2 * max_thread_num_)
-        {
-            size_t add_worker_num = 0;
-
-            add_worker_num = std::min(max_thread_num_ - workers_.size(), (workers_.size() + 1) / 2);
-
-            for (size_t i = 0; i < add_worker_num; ++i)
-            {
-                add_worker();
-            }
-        }
         thread_num_ = workers_.size();
 
         if (task_queue_.empty())
@@ -222,16 +244,6 @@ inline void ThreadPool::monitor()
 
 inline void ThreadPool::dispatch_task(const Task &task)
 {
-    if (!workers_.empty())
-    {
-        auto it = std::min_element(workers_.begin(), workers_.end(), [](const Worker_ptr &a, const Worker_ptr &b)
-                 {
-                     if (a == b)
-                         return false;
-                     return a->pending_task_size() < b->pending_task_size();
-                 });
-        if (it == workers_.end())
-            return;
-        it->get()->add_task(task);
-    }
+    strategy_->dispatch_task(workers_, task);
 }
+
